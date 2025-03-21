@@ -1,0 +1,9 @@
+fastapi
+pydantic
+langchain
+faiss-cpu
+openai
+python-multipart
+tiktoken
+pypdf
+uvicorn[standard]

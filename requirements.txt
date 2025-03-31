@@ -1,11 +1,10 @@
-python-multipart
 fastapi
 pydantic
 requests
 beautifulsoup4
 python-dotenv
-langchain
 fastapi-middleware-cors
+langchain
 openai
 faiss-cpu
 langchain-community
@@ -13,3 +12,4 @@ uvicorn
 tiktoken
 websockets
 motor
+fastapi[standard]

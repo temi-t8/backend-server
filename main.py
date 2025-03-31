@@ -1,10 +1,17 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
 import os
+import logging
+from datetime import datetime
+from typing import Optional
+
 import requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
+import difflib
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from motor.motor_asyncio import AsyncIOMotorClient
 from langchain.document_loaders import DirectoryLoader, TextLoader, PyPDFLoader
 from langchain.text_splitter import CharacterTextSplitter
 from langchain.embeddings import OpenAIEmbeddings
@@ -12,223 +19,278 @@ from langchain.vectorstores import FAISS
 from langchain.chat_models import ChatOpenAI
 from langchain.chains import RetrievalQA
 from langchain.schema import Document
-import difflib
-from motor.motor_asyncio import AsyncIOMotorClient
-from datetime import datetime
 
-# Load environment variables (needed for local testing)
-load_dotenv()
+# ========== Configuration ==========
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
-# MongoDB Connection
-MONGO_URI = os.environ.get("MONGODB_URI")
-DB_NAME = "RAGDB"
-COLLECTION_NAME = "ConversationTracker"
+# Validate environment variables
+try:
+    MONGO_URI = os.environ["MONGODB_URI"]
+    OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+    DB_NAME = os.environ.get("DB_NAME", "RAGDB")
+    COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "ConversationTracker")
+    ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "").split(",")
+except KeyError as e:
+    logger.critical(f"Missing required environment variable: {e}")
+    raise
 
-# Validate MongoDB URI
-if not MONGO_URI:
-    raise RuntimeError("Missing MONGODB_URI environment variable")
+# Constants
+REQUEST_TIMEOUT = 10
+MAX_RESPONSE_LENGTH = 5000
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 100
 
-client = AsyncIOMotorClient(MONGO_URI)
-db = client[DB_NAME]
-collection = db[COLLECTION_NAME]
+# ========== Application Setup ==========
+app = FastAPI(
+    title="RAG WebSocket Server",
+    version="1.0.0",
+    docs_url=None,  # Disable docs in production
+    redoc_url=None
+)
 
-
-async def store_question_answer(query: str, answer: str):
-    document = {
-        "query": query,
-        "answer": answer,
-        "timestamp": datetime.utcnow()
-    }
-    await collection.insert_one(document)
-
-
-# Validate API key from env
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY environment variable")
-
-# FastAPI setup
-app = FastAPI()
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ========== Database Setup ==========
+class DatabaseManager:
+    def __init__(self):
+        self.client = None
+        self.db = None
+        self.collection = None
 
-# Request and Response Models
-class QueryRequest(BaseModel):
-    query: str
+    async def connect(self):
+        try:
+            self.client = AsyncIOMotorClient(
+                MONGO_URI,
+                serverSelectionTimeoutMS=5000,
+                maxPoolSize=100,
+                minPoolSize=10
+            )
+            await self.client.admin.command('ping')
+            self.db = self.client[DB_NAME]
+            self.collection = self.db[COLLECTION_NAME]
+            logger.info("MongoDB connection established")
+        except Exception as e:
+            logger.error(f"Database connection failed: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail="Service unavailable (database connection failed)"
+            )
 
+    async def store_conversation(self, query: str, answer: str) -> bool:
+        try:
+            document = {
+                "query": query,
+                "answer": answer,
+                "timestamp": datetime.utcnow()
+            }
+            await self.collection.insert_one(document)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to store conversation: {e}")
+            return False
 
-class AnswerResponse(BaseModel):
-    answer: str
+db_manager = DatabaseManager()
 
+# ========== Models ==========
+class HealthResponse(BaseModel):
+    status: str
+    version: str
+    db_status: str
 
-# Program page crawler with debug
-def get_program_page_content(query: str) -> str | None:
-    base_url = "https://www.mohawkcollege.ca"
-    search_url = f"{base_url}/programs/search"
+# ========== Core Services ==========
+class WebScraper:
+    @staticmethod
+    async def scrape_program_page(query: str) -> Optional[str]:
+        base_url = "https://www.mohawkcollege.ca"
+        search_url = f"{base_url}/programs/search"
+        
+        try:
+            res = requests.get(search_url, timeout=REQUEST_TIMEOUT)
+            res.raise_for_status()
+            
+            soup = BeautifulSoup(res.text, "html.parser")
+            program_links = {
+                link.text.strip(): link["href"]
+                for link in soup.find_all("a", href=True)
+                if link["href"].startswith("/programs/") and link.text.strip()
+            }
+            
+            titles = list(program_links.keys())
+            match = difflib.get_close_matches(query, titles, n=1, cutoff=0.4)
+            
+            if match:
+                title = match[0]
+                href = program_links[title]
+                full_url = base_url + href
+                
+                page_res = requests.get(full_url, timeout=REQUEST_TIMEOUT)
+                page_res.raise_for_status()
+                
+                detail_soup = BeautifulSoup(page_res.text, "html.parser")
+                return detail_soup.get_text(separator="\n", strip=True)[:MAX_RESPONSE_LENGTH]
+            
+            return None
+            
+        except requests.RequestException as e:
+            logger.error(f"Web request failed: {e}")
+        except Exception as e:
+            logger.error(f"Scraping error: {e}")
+        return None
+
+class RAGService:
+    def __init__(self):
+        self.qa_chain = None
+        self.initialized = False
+
+    async def initialize(self):
+        try:
+            # Load documents
+            docs = []
+            txt_loader = DirectoryLoader("data", glob="**/*.txt", loader_cls=TextLoader)
+            pdf_loader = DirectoryLoader("data", glob="**/*.pdf", loader_cls=PyPDFLoader)
+            docs.extend(txt_loader.load())
+            docs.extend(pdf_loader.load())
+
+            # Process documents
+            splitter = CharacterTextSplitter(
+                chunk_size=CHUNK_SIZE,
+                chunk_overlap=CHUNK_OVERLAP
+            )
+            chunks = splitter.split_documents(docs)
+            
+            # Create vector store
+            embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+            vectordb = FAISS.from_documents(chunks, embeddings)
+            
+            # Create QA chain
+            self.qa_chain = RetrievalQA.from_chain_type(
+                llm=ChatOpenAI(
+                    model="gpt-3.5-turbo",
+                    temperature=0,
+                    openai_api_key=OPENAI_API_KEY
+                ),
+                chain_type="stuff",
+                retriever=vectordb.as_retriever(),
+            )
+            self.initialized = True
+            logger.info("RAG service initialized successfully")
+        except Exception as e:
+            logger.error(f"RAG initialization failed: {e}")
+            raise
+
+    async def query(self, question: str) -> dict:
+        if not self.initialized:
+            return {"answer": "Service unavailable", "success": False}
+        
+        try:
+            result = self.qa_chain({"query": question})
+            return {"answer": result["result"], "success": True}
+        except Exception as e:
+            logger.error(f"RAG query failed: {e}")
+            return {"answer": "Error processing request", "success": False}
+
+rag_service = RAGService()
+
+# ========== API Endpoints ==========
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
     try:
-        print(f"\nCrawling programs list: {search_url}", flush=True)
-        res = requests.get(search_url, timeout=10)
-        soup = BeautifulSoup(res.text, "html.parser")
-        program_links = {
-            link.text.strip(): link["href"]
-            for link in soup.find_all("a", href=True)
-            if link["href"].startswith("/programs/") and link.text.strip()
-        }
-        titles = list(program_links.keys())
-        match = difflib.get_close_matches(query, titles, n=1, cutoff=0.4)
-        if match:
-            title = match[0]
-            href = program_links[title]
-            full_url = base_url + href
-            print(f"[MATCH] Found: {title} => {full_url}", flush=True)
-            page_res = requests.get(full_url, timeout=10)
-            detail_soup = BeautifulSoup(page_res.text, "html.parser")
-            return detail_soup.get_text(separator="\n", strip=True)[:5000]
-        print("No program match found", flush=True)
-        return None
+        await db_manager.client.admin.command('ping')
+        db_status = "healthy"
     except Exception as e:
-        print(f"Error during program crawl: {e}", flush=True)
-        return None
-
-
-# MSA or Services crawler
-def get_msa_or_services_content(query: str) -> str | None:
-    sources = [
-        ("msa", "https://mohawkstudents.ca/"),
-        ("student association", "https://mohawkstudents.ca/"),
-        ("club", "https://mohawkstudents.ca/"),
-        ("admission", "https://www.mohawkcollege.ca/future-ready-toolkit/services-supports"),
-        ("registration", "https://www.mohawkcollege.ca/future-ready-toolkit/services-supports"),
-        ("support", "https://www.mohawkcollege.ca/future-ready-toolkit/services-supports"),
-    ]
-    for keyword, url in sources:
-        if keyword in query:
-            try:
-                print(f"Crawling {keyword} content: {url}", flush=True)
-                res = requests.get(url, timeout=10)
-                soup = BeautifulSoup(res.text, "html.parser")
-                return soup.get_text(separator="\n", strip=True)[:5000]
-            except Exception as e:
-                print(f"Error crawling {url}: {e}", flush=True)
-    return None
-
-
-# Load static RAG
-print("Loading local documents...", flush=True)
-
-
-def initialize_qa_chain():
-    docs = []
-    txt_loader = DirectoryLoader("data", glob="**/*.txt", loader_cls=TextLoader)
-    pdf_loader = DirectoryLoader("data", glob="**/*.pdf", loader_cls=PyPDFLoader)
-    docs.extend(txt_loader.load())
-    docs.extend(pdf_loader.load())
-    splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    chunks = splitter.split_documents(docs)
-    embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-    vectordb = FAISS.from_documents(chunks, embeddings)
-    return RetrievalQA.from_chain_type(
-        llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0, openai_api_key=OPENAI_API_KEY),
-        chain_type="stuff",
-        retriever=vectordb.as_retriever(),
-    )
-
-
-qa_chain = initialize_qa_chain()
-print("Local documents loaded.", flush=True)
-
-# # REST API
-# @app.post("/answer", response_model=AnswerResponse)
-# async def answer_query(request: QueryRequest):
-#     query = request.query.lower()
-#     print(f"\n🚀 [REST] Query: {query}", flush=True)
-
-#     if any(word in query for word in ["msa", "club", "event", "student association"]):
-#         msa_text = get_msa_or_services_content(query)
-#         if msa_text:
-#             print("[REST] Using MSA/services crawler", flush=True)
-#             return run_rag_on_text(query, msa_text)
-
-#     elif "program" in query or "mohawk college" in query:
-#         program_text = get_program_page_content(query)
-#         if program_text:
-#             print("[REST] Using program crawler", flush=True)
-#             return run_rag_on_text(query, program_text)
-
-#     elif any(word in query for word in ["admission", "registration", "support", "services"]):
-#         services_text = get_msa_or_services_content(query)
-#         if services_text:
-#             print("📄 [REST] Using services crawler", flush=True)
-#             return run_rag_on_text(query, services_text)
-
-#     print("[REST] Using local documents", flush=True)
-#     result = qa_chain.invoke({"query": request.query})
-#     return {"answer": result["result"]}
-
+        db_status = f"unhealthy: {str(e)}"
+    
+    return {
+        "status": "running",
+        "version": app.version,
+        "db_status": db_status
+    }
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    client_ip = websocket.client.host if websocket.client else "unknown"
+    logger.info(f"WebSocket connection from {client_ip}")
+    
     try:
         while True:
-            query = await websocket.receive_text()
-            lowered = query.lower()
-            print(f"\n[WebSocket] Query: {lowered}", flush=True)
-
-            if any(word in lowered for word in ["msa", "club", "event", "student association"]):
-                msa_text = get_msa_or_services_content(lowered)
-                if msa_text:
-                    print("[WebSocket] Using MSA/services crawler", flush=True)
-                    result = run_rag_on_text(lowered, msa_text)
-                    await store_question_answer(lowered, result["answer"])
-                    await websocket.send_text(result["answer"])
+            try:
+                # Receive and validate query
+                query = await websocket.receive_text()
+                if not query or len(query) > 1000:
+                    await websocket.send_text("Invalid input length (1-1000 chars allowed)")
                     continue
-
-            elif "program" in lowered or "mohawk college" in lowered:
-                program_text = get_program_page_content(lowered)
-                if program_text:
-                    print("[WebSocket] Using program crawler", flush=True)
-                    result = run_rag_on_text(lowered, program_text)
-                    await store_question_answer(lowered, result["answer"])
-                    await websocket.send_text(result["answer"])
-                    continue
-
-            elif any(word in lowered for word in ["admission", "registration", "support", "services"]):
-                services_text = get_msa_or_services_content(lowered)
-                if services_text:
-                    print("[WebSocket] Using services crawler", flush=True)
-                    result = run_rag_on_text(lowered, services_text)
-                    await store_question_answer(lowered, result["answer"])
-                    await websocket.send_text(result["answer"])
-                    continue
-
-            print("[WebSocket] Using local RAG", flush=True)
-            result = qa_chain.invoke({"query": query})
-            await store_question_answer(query, result["result"])
-            await websocket.send_text(result["result"])
-
+                
+                # Process query
+                lowered = query.lower()
+                
+                # Web scraping logic
+                if any(word in lowered for word in ["msa", "club", "event"]):
+                    content = await WebScraper.scrape_program_page(lowered)
+                    if content:
+                        result = await rag_service.query(content)
+                        await db_manager.store_conversation(query, result["answer"])
+                        await websocket.send_text(result["answer"])
+                        continue
+                
+                # Standard RAG processing
+                result = await rag_service.query(query)
+                await db_manager.store_conversation(query, result["answer"])
+                await websocket.send_text(result["answer"])
+                
+            except Exception as e:
+                logger.error(f"Processing error: {e}")
+                await websocket.send_text("An error occurred processing your request")
+                
     except WebSocketDisconnect:
-        print("WebSocket disconnected", flush=True)
+        logger.info(f"WebSocket disconnected ({client_ip})")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
+# ========== Startup/Shutdown ==========
+@app.on_event("startup")
+async def startup():
+    try:
+        await db_manager.connect()
+        await rag_service.initialize()
+        logger.info("Service startup completed")
+    except Exception as e:
+        logger.critical(f"Startup failed: {e}")
+        raise
 
-# Reusable RAG on text
-def run_rag_on_text(query: str, content: str) -> dict:
-    doc = Document(page_content=content)
-    splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    chunks = splitter.split_documents([doc])
-    embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-    vectorstore = FAISS.from_documents(chunks, embeddings)
-    retriever = vectorstore.as_retriever()
-    rag_chain = RetrievalQA.from_chain_type(
-        llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0, openai_api_key=OPENAI_API_KEY),
-        chain_type="stuff",
-        retriever=retriever,
+@app.on_event("shutdown")
+async def shutdown():
+    try:
+        if db_manager.client:
+            db_manager.client.close()
+        logger.info("Service shutdown completed")
+    except Exception as e:
+        logger.error(f"Shutdown error: {e}")
+
+# ========== Main Execution ==========
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        log_config=None  # Use default logging
     )
-    result = rag_chain.invoke({"query": query})
-    return {"answer": result["result"]}

@@ -3,7 +3,6 @@ pydantic
 requests
 beautifulsoup4
 python-dotenv
-fastapi-middleware-cors
 langchain
 openai
 faiss-cpu

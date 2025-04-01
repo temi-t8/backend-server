@@ -63,30 +63,6 @@ class DatabaseManager:
 
 db_manager = DatabaseManager()
 
-# Web Scraper
-class WebScraper:
-    @staticmethod
-    async def scrape_page(url: str) -> Optional[str]:
-        try:
-            res = requests.get(url, timeout=REQUEST_TIMEOUT)
-            res.raise_for_status()
-            return BeautifulSoup(res.text, "html.parser").get_text(separator="\n", strip=True)[:MAX_RESPONSE_LENGTH]
-        except requests.RequestException as e:
-            logger.error(f"Scraping error: {e}")
-            return None
-
-    @staticmethod
-    async def scrape_program_page(query: str) -> Optional[str]:
-        base_url = "https://www.mohawkcollege.ca"
-        search_url = f"{base_url}/programs/search"
-        res = requests.get(search_url, timeout=REQUEST_TIMEOUT)
-        soup = BeautifulSoup(res.text, "html.parser")
-        program_links = {link.text.strip(): link["href"] for link in soup.find_all("a", href=True) if link["href"].startswith("/programs/")}
-        match = difflib.get_close_matches(query, list(program_links.keys()), n=1, cutoff=0.4)
-        if match:
-            return await WebScraper.scrape_page(base_url + program_links[match[0]])
-        return None
-
 # RAG Service
 class RAGService:
     def __init__(self):
@@ -104,36 +80,112 @@ class RAGService:
 
 rag_service = RAGService()
 
+# Web Scrapers
+class WebScraper:
+
+    @staticmethod
+    def get_program_page_content(query: str) -> Optional[str]:
+        base_url = "https://www.mohawkcollege.ca"
+        search_url = f"{base_url}/programs/search"
+        try:
+            logger.info(f"Crawling programs list: {search_url}")
+            res = requests.get(search_url, timeout=REQUEST_TIMEOUT)
+            soup = BeautifulSoup(res.text, "html.parser")
+            program_links = {
+                link.text.strip(): link["href"]
+                for link in soup.find_all("a", href=True)
+                if link["href"].startswith("/programs/") and link.text.strip()
+            }
+            titles = list(program_links.keys())
+            match = difflib.get_close_matches(query, titles, n=1, cutoff=0.4)
+            if match:
+                title = match[0]
+                href = program_links[title]
+                full_url = base_url + href
+                logger.info(f"[MATCH] Found: {title} => {full_url}")
+                page_res = requests.get(full_url, timeout=REQUEST_TIMEOUT)
+                detail_soup = BeautifulSoup(page_res.text, "html.parser")
+                return detail_soup.get_text(separator="\n", strip=True)[:MAX_RESPONSE_LENGTH]
+            logger.info("No program match found")
+            return None
+        except Exception as e:
+            logger.error(f"Error during program crawl: {e}")
+            return None
+
+    @staticmethod
+    def get_msa_or_services_content(query: str) -> Optional[str]:
+        sources = [
+            ("msa", "https://mohawkstudents.ca/"),
+            ("student association", "https://mohawkstudents.ca/"),
+            ("club", "https://mohawkstudents.ca/"),
+            ("admission", "https://www.mohawkcollege.ca/future-ready-toolkit/services-supports"),
+            ("registration", "https://www.mohawkcollege.ca/future-ready-toolkit/services-supports"),
+            ("support", "https://www.mohawkcollege.ca/future-ready-toolkit/services-supports"),
+        ]
+        for keyword, url in sources:
+            if keyword in query:
+                try:
+                    logger.info(f"Crawling {keyword} content: {url}")
+                    res = requests.get(url, timeout=REQUEST_TIMEOUT)
+                    soup = BeautifulSoup(res.text, "html.parser")
+                    return soup.get_text(separator="\n", strip=True)[:MAX_RESPONSE_LENGTH]
+                except Exception as e:
+                    logger.error(f"Error crawling {url}: {e}")
+        return None
+
+    @staticmethod
+    def run_rag_on_text(query: str, content: str) -> dict:
+        doc = Document(page_content=content)
+        splitter = CharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+        chunks = splitter.split_documents([doc])
+        embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+        vectorstore = FAISS.from_documents(chunks, embeddings)
+        retriever = vectorstore.as_retriever()
+        rag_chain = RetrievalQA.from_chain_type(
+            llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0, openai_api_key=OPENAI_API_KEY),
+            chain_type="stuff",
+            retriever=retriever,
+        )
+        result = rag_chain.invoke({"query": query})
+        return {"answer": result["result"]}
+
+
 # WebSocket API
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    while True:
-        try:
+    try:
+        while True:
             query = await websocket.receive_text()
             lowered = query.lower()
-            response = None
+            logger.info(f"[WebSocket] Query: {lowered}")
 
-            if any(word in lowered for word in ["msa", "club", "event", "student association"]):
-                response = await WebScraper.scrape_page("https://mohawkstudents.ca/")
-            elif any(word in lowered for word in ["admission", "registration", "support", "services"]):
-                response = await WebScraper.scrape_page("https://www.mohawkcollege.ca/future-ready-toolkit/services-supports")
-            elif "program" in lowered or "mohawk college" in lowered:
-                response = await WebScraper.scrape_program_page(lowered)
+            msa_text = WebScraper.get_msa_or_services_content(lowered)
+            if msa_text:
+                logger.info("[WebSocket] Using MSA/services crawler")
+                result = WebScraper.run_rag_on_text(lowered, msa_text)
+                await db_manager.store_conversation(lowered, result["answer"])
+                await websocket.send_text(result["answer"])
+                continue
 
-            if response:
-                answer = await rag_service.query(response)
-            else:
-                answer = await rag_service.query(query)
+            program_text = WebScraper.get_program_page_content(lowered)
+            if program_text:
+                logger.info("[WebSocket] Using program crawler")
+                result = WebScraper.run_rag_on_text(lowered, program_text)
+                await db_manager.store_conversation(lowered, result["answer"])
+                await websocket.send_text(result["answer"])
+                continue
 
+            logger.info("[WebSocket] Using local RAG")
+            answer = await rag_service.query(query)
             await db_manager.store_conversation(query, answer)
             await websocket.send_text(answer)
-        except WebSocketDisconnect:
-            logger.info("WebSocket disconnected")
-            break
-        except Exception as e:
-            logger.error(f"WebSocket error: {e}")
-            await websocket.send_text("Error processing request")
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        await websocket.send_text("Error processing request")
 
 # API Endpoint for Health Check
 @app.get("/health")

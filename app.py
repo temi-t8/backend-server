@@ -2,7 +2,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from typing import Optional
 import os
-import openai
+from openai import OpenAI
+
 import requests
 import difflib
 from bs4 import BeautifulSoup
@@ -37,7 +38,7 @@ DB_NAME = os.getenv("DB_NAME", "RAGDB")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "ConversationTracker")
 
 # Set OpenAI key
-openai.api_key = OPENAI_API_KEY
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Logger
 logging.basicConfig(level=logging.INFO)
@@ -106,14 +107,12 @@ async def refine_query(original_query: str) -> str:
     )
 
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": original_query}
-            ]
-        )
-        refined = response["choices"][0]["message"]["content"].strip()
+        response = client.chat.completions.create(model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": original_query}
+        ])
+        refined = response.choices[0].message.content.strip()
         print(f"[Refinement] '{original_query}' -> '{refined}'", flush=True)
         return refined.strip('"')
     except Exception as e:
@@ -142,15 +141,13 @@ async def generate_fallback_response(refined_query: str, original_query: str) ->
                     "You are a cheerful assistant. The user wants something fun. "
                     "Tell a short joke, funny story, or riddle in a playful tone."
                 )
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": refined_query}
-                    ],
-                    temperature=0.9
-                )
-                return response["choices"][0]["message"]["content"].strip()
+                response = client.chat.completions.create(model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": refined_query}
+                ],
+                temperature=0.9)
+                return response.choices[0].message.content.strip()
             except Exception as e:
                 print(f"[Fun Fallback Error] {e}", flush=True)
                 return "I'm here to entertain you, but I ran into an issue. Try again in a bit!"
@@ -163,15 +160,13 @@ async def generate_fallback_response(refined_query: str, original_query: str) ->
                 prompt = (
                     "You are a playful weather assistant for college students in Ontario. If you can't access real weather, pretend to be a fun weather forecaster and give a cheerful imaginary forecast."
                 )
-                response = openai.ChatCompletion.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": refined_query}
-                    ],
-                    temperature=0.8
-                )
-                return response["choices"][0]["message"]["content"].strip()
+                response = client.chat.completions.create(model="gpt-4",
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": refined_query}
+                ],
+                temperature=0.8)
+                return response.choices[0].message.content.strip()
             except Exception as e:
                 print(f"[Time/Weather Fallback Error] {e}", flush=True)
                 return "I'd love to help, but I don't have a window or a clock... just vibes!"
@@ -183,15 +178,13 @@ async def generate_fallback_response(refined_query: str, original_query: str) ->
                 "You are a safe and polite assistant. If the query seems offensive or inappropriate, "
                 "reply kindly and maintain respectful tone. Otherwise, say it's okay."
             )
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": moderation_prompt},
-                    {"role": "user", "content": refined_query}
-                ],
-                temperature=0.3
-            )
-            answer = response["choices"][0]["message"]["content"].strip()
+            response = client.chat.completions.create(model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": moderation_prompt},
+                {"role": "user", "content": refined_query}
+            ],
+            temperature=0.3)
+            answer = response.choices[0].message.content.strip()
             if any(word in answer.lower() for word in ["inappropriate", "offensive", "not allowed", "respectful", "violates"]):
                 print(f"[Fallback] ❌ Inappropriate content blocked", flush=True)
                 return answer
@@ -205,15 +198,13 @@ async def generate_fallback_response(refined_query: str, original_query: str) ->
                 "You are a helpful assistant for Mohawk College. The user asked something out of scope. "
                 "Gently redirect them or share something fun, helpful, or generic if possible."
             )
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": refined_query}
-                ],
-                temperature=0.5
-            )
-            return response["choices"][0]["message"]["content"].strip()
+            response = client.chat.completions.create(model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": refined_query}
+            ],
+            temperature=0.5)
+            return response.choices[0].message.content.strip()
         except Exception as e:
             print(f"[General Fallback Error] {e}", flush=True)
             return "I'm not sure how to answer that, but I'm happy to help with anything Mohawk-related 😊"
@@ -256,18 +247,16 @@ async def get_program_page_content(query: str) -> Optional[str]:
                 "Present a helpful and engaging response with matching program names."
             )
             user_prompt = (
-                f"The user asked: '{query}'\n\n"
+                f"The user asked: '{query}'"
             )
 
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.7
-            )
-            return response["choices"][0]["message"]["content"].strip()
+            response = client.chat.completions.create(model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.7)
+            return response.choices[0].message.content.strip()
 
         print("[Crawler] No matching program titles found", flush=True)
 
@@ -370,8 +359,9 @@ async def websocket_endpoint(websocket: WebSocket):
             ]):
                 print("[WebSocket] 🎭 Fun fallback triggered before RAG", flush=True)
                 fallback = await generate_fallback_response(refined, msg)
-                await db_manager.store_conversation(msg, fallback)
-                await websocket.send_json({"answer": fallback})
+                clean_fallback = fallback.replace("\n", " ").strip()
+                await db_manager.store_conversation(msg, clean_fallback)
+                await websocket.send_json({"answer": clean_fallback})
                 continue
 
             for checker, fetch_func in [
@@ -384,8 +374,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     if content:
                         rag_result = run_rag_on_text(refined_lower, content)
                         if not rag_result["fallback"]:
-                            await db_manager.store_conversation(msg, rag_result["answer"])
-                            await websocket.send_json({"answer": rag_result["answer"]})
+                            clean_answer = rag_result["answer"].replace("\n", " ").strip()
+                            await db_manager.store_conversation(msg, clean_answer)
+                            await websocket.send_json({"answer": clean_answer})
                             break
             else:
                 print("[WebSocket] Using local RAG...", flush=True)
@@ -393,14 +384,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not result["result"].strip() or "i don't know" in result["result"].lower():
                     print("🔁 Triggering fallback: No good local RAG response", flush=True)
                     fallback = await generate_fallback_response(refined, msg)
-                    await db_manager.store_conversation(msg, fallback)
-                    await websocket.send_json({"answer": fallback})
+                    clean_fallback = fallback.replace("\n", " ").strip()
+                    await db_manager.store_conversation(msg, clean_fallback)
+                    await websocket.send_json({"answer": clean_fallback})
                 else:
-                    await websocket.send_json({"answer": result["result"]})
-                    await db_manager.store_conversation(msg, result["result"])
+                    clean_answer = result["result"].replace("\n", " ").strip()
+                    await websocket.send_json({"answer": clean_answer})
+                    await db_manager.store_conversation(msg, clean_answer)
     except WebSocketDisconnect:
         print("WebSocket disconnected", flush=True)
-
 
 # Health check
 @app.get("/health")

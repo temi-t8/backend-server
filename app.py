@@ -16,6 +16,10 @@ from langchain.chat_models import ChatOpenAI
 from langchain.chains import RetrievalQA
 from langchain.schema import Document
 from dotenv import load_dotenv
+import re
+from collections import Counter
+from difflib import SequenceMatcher
+from langchain.prompts import PromptTemplate
 import logging
 from datetime import datetime
 from typing import Optional
@@ -46,6 +50,21 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"]
 )
+rag_prompt = PromptTemplate(
+    input_variables=["context", "question"],
+    template="""
+You are a friendly and knowledgeable assistant for Mohawk College. 
+Answer the question using the provided information below. Be engaging, helpful, and concise. 
+Use a cheerful tone when appropriate.
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+)
+
 
 # MongoDB Manager
 class DatabaseManager:
@@ -79,10 +98,11 @@ def is_domain_related(query_lower: str) -> bool:
 
 async def refine_query(original_query: str) -> str:
     system_prompt = (
-    "You are a helpful assistant for Mohawk College. Fix spelling and recognition errors in the query. "
-    "If the query refers to a Mohawk program and the name is partially written or incorrect, correct and complete it. "
-    "Example: 'sofware devlopment' should become 'Computer system Technician Software Development program at Mohawk College'. "
-    "Return only the corrected query as a question."
+        "You are a helpful assistant for Mohawk College. Your job is to fix minor spelling or recognition errors in the query. "
+        "If it's a joke, story, fun question, or out-of-scope query, or weather related or time, leave it mostly untouched. "
+        "Also, do NOT respond to the query yourself. Only return the refined query as-is, just corrected."
+        "If the query refers to a Mohawk program and the name is partially written or incorrect, correct and complete it. "
+        "Example: 'sofware devlopment' should become 'Computer system Technician Software Development program at Mohawk College'. "
     )
 
     try:
@@ -104,16 +124,86 @@ async def generate_fallback_response(refined_query: str, original_query: str) ->
     rq_lower = refined_query.lower()
     fun_triggers = [
         "joke", "tell me a joke", "funny", "story", "short story",
-        "let's play", "play a game", "riddle", "entertain me", "make me laugh", "game"
+        "let's play", "play a game", "riddle", "entertain me", "make me laugh", "game", "laugh", "happy"
+    ]
+
+    time_weather_triggers = [
+        "weather", "temperature", "forecast", "raining", "sunny",
+        "what time", "time is it", "current time", "clock", "date", "day"
     ]
 
     try:
-        # Fun fallback
+        # --- Fun Queries ---
         if any(term in rq_lower for term in fun_triggers):
-            print(f"[Fallback] 🎭 Fun fallback for query: {refined_query}", flush=True)
+            print(f"[Fallback] 🎭 Fun fallback for: {refined_query}", flush=True)
+
+            try:
+                prompt = (
+                    "You are a cheerful assistant. The user wants something fun. "
+                    "Tell a short joke, funny story, or riddle in a playful tone."
+                )
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": refined_query}
+                    ],
+                    temperature=0.9
+                )
+                return response["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                print(f"[Fun Fallback Error] {e}", flush=True)
+                return "I'm here to entertain you, but I ran into an issue. Try again in a bit!"
+
+        # --- Time/Weather Queries ---
+        if any(term in rq_lower for term in time_weather_triggers):
+            print(f"[Fallback] Time/Weather fallback triggered: {refined_query}", flush=True)
+
+            try:
+                prompt = (
+                    "You are a playful weather assistant for college students in Ontario. If you can't access real weather, pretend to be a fun weather forecaster and give a cheerful imaginary forecast."
+                )
+                response = openai.ChatCompletion.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": refined_query}
+                    ],
+                    temperature=0.8
+                )
+                return response["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                print(f"[Time/Weather Fallback Error] {e}", flush=True)
+                return "I'd love to help, but I don't have a window or a clock... just vibes!"
+
+        # --- Inappropriate Detection (Polite Response) ---
+        print(f"[Fallback] 🔍 Checking content safety...", flush=True)
+        try:
+            moderation_prompt = (
+                "You are a safe and polite assistant. If the query seems offensive or inappropriate, "
+                "reply kindly and maintain respectful tone. Otherwise, say it's okay."
+            )
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": moderation_prompt},
+                    {"role": "user", "content": refined_query}
+                ],
+                temperature=0.3
+            )
+            answer = response["choices"][0]["message"]["content"].strip()
+            if any(word in answer.lower() for word in ["inappropriate", "offensive", "not allowed", "respectful", "violates"]):
+                print(f"[Fallback] ❌ Inappropriate content blocked", flush=True)
+                return answer
+        except Exception as e:
+            print(f"[Moderation Error] {e}", flush=True)
+
+        # --- General Fallback ---
+        print(f"[Fallback] ⚠️ General fallback triggered", flush=True)
+        try:
             prompt = (
-                "You are a cheerful and witty assistant. The user wants to be entertained — "
-                "respond with a short joke, funny story, riddle, or quick game in a fun and engaging way!"
+                "You are a helpful assistant for Mohawk College. The user asked something out of scope. "
+                "Gently redirect them or share something fun, helpful, or generic if possible."
             )
             response = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
@@ -121,70 +211,69 @@ async def generate_fallback_response(refined_query: str, original_query: str) ->
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": refined_query}
                 ],
-                temperature=0.9
+                temperature=0.5
+            )
+            return response["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"[General Fallback Error] {e}", flush=True)
+            return "I'm not sure how to answer that, but I'm happy to help with anything Mohawk-related 😊"
+
+    except Exception as e:
+        print(f"[Fallback Crash] {e}", flush=True)
+        return "Oops! Something went wrong while trying to respond. Try again shortly."
+
+
+
+async def get_program_page_content(query: str) -> Optional[str]:
+    base_url = "https://www.mohawkcollege.ca"
+    search_url = f"{base_url}/programs/search"
+    try:
+        print("[Crawler] Fetching all program titles...", flush=True)
+        res = requests.get(search_url, timeout=10)
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        # Build dictionary of {title: href}
+        programs = {
+            a.text.strip(): a["href"]
+            for a in soup.find_all("a", href=True)
+            if a["href"].startswith("/programs/") and a.text.strip()
+        }
+
+        query_keywords = set(re.findall(r'\b\w+\b', query.lower()))
+
+        # Score each program based on keyword matches
+        matched_titles = []
+        for title in programs.keys():
+            title_words = set(re.findall(r'\b\w+\b', title.lower()))
+            if query_keywords & title_words:
+                matched_titles.append(title)
+
+        if matched_titles:
+            print(f"[Crawler] Found {len(matched_titles)} matched programs", flush=True)
+            # Summarize list via ChatGPT
+            system_prompt = (
+                "You are a friendly assistant for Mohawk College. The user asked for a list of programs. "
+                "Present a helpful and engaging response with matching program names."
+            )
+            user_prompt = (
+                f"The user asked: '{query}'\n\n"
+            )
+
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.7
             )
             return response["choices"][0]["message"]["content"].strip()
 
-        # Inappropriate content handling (GPT detects and responds politely)
-        print(f"[Fallback] 🔍 Checking for inappropriate or unsafe content...", flush=True)
-        moderation_prompt = (
-            "You are a safety-conscious assistant. If the user's message includes unsafe, offensive, or inappropriate content, "
-            "respond in a calm, respectful, and polite way. Do not directly accuse or label the user. "
-            "Keep your response short and friendly, and encourage respectful interaction."
-        )
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": moderation_prompt},
-                {"role": "user", "content": refined_query}
-            ],
-            temperature=0.7
-        )
-        answer = response["choices"][0]["message"]["content"].strip()
-
-        # Heuristic: if the GPT thinks it's inappropriate, it will respond carefully
-        if any(keyword in answer.lower() for keyword in ["inappropriate", "offensive", "not allowed", "respectful", "safe environment"]):
-            print(f"[Fallback]Inappropriate response triggered: {refined_query}", flush=True)
-            return answer
-
-        # General fallback
-        print(f"[Fallback] General fallback triggered for query: {refined_query}", flush=True)
-        general_prompt = (
-            "You are a helpful and engaging assistant for Mohawk College. The user's question is outside your scope, "
-            "so respond politely and redirect them to ask something related to the college, or share something fun if appropriate."
-        )
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": general_prompt},
-                {"role": "user", "content": refined_query}
-            ],
-            temperature=0.5
-        )
-        return response["choices"][0]["message"]["content"].strip()
+        print("[Crawler] No matching program titles found", flush=True)
 
     except Exception as e:
-        print(f"[Fallback Error] {e}", flush=True)
-        return "Oops! Something went wrong while answering that. Try again later."
+        print(f"[Crawler Error - Program List] {e}", flush=True)
 
-# --- Crawlers ---
-async def get_program_page_content(query: str) -> Optional[str]:
-    base_url = "https://www.mohawkcollege.ca"
-    try:
-        print("[Crawler] Searching Mohawk program page...", flush=True)
-        res = requests.get(f"{base_url}/programs/search", timeout=10)
-        soup = BeautifulSoup(res.text, "html.parser")
-        links = {
-            a.text.strip(): a["href"]
-            for a in soup.find_all("a", href=True) if a["href"].startswith("/programs/")
-        }
-        match = difflib.get_close_matches(query, list(links.keys()), n=1, cutoff=0.4)
-        if match:
-            detail_url = base_url + links[match[0]]
-            res = requests.get(detail_url, timeout=10)
-            return BeautifulSoup(res.text, "html.parser").get_text(separator="\n", strip=True)[:5000]
-    except Exception as e:
-        print(f"[Crawler Error - Program] {e}", flush=True)
     return None
 
 async def get_msa_or_services_content(query: str) -> Optional[str]:
@@ -229,9 +318,12 @@ def run_rag_on_text(query: str, content: str) -> dict:
     if not docs:
         print("[RAG] No relevant documents found", flush=True)
         return {"fallback": True, "answer": None}
+
     rag_chain = RetrievalQA.from_chain_type(
-        llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0.3, openai_api_key=OPENAI_API_KEY),
-        chain_type="stuff", retriever=retriever
+        llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0.6, openai_api_key=OPENAI_API_KEY),
+        chain_type="stuff",
+        retriever=retriever,
+        chain_type_kwargs={"prompt": rag_prompt}
     )
     result = rag_chain.invoke({"query": query})
     return {"fallback": False, "answer": result["result"]}
@@ -245,7 +337,7 @@ async def answer_query(request: QueryRequest):
 
     for checker, fetch_func in [
         (["msa", "club", "student", "association"], get_msa_or_services_content),
-        (["program", "course", "mohawk", "college"], get_program_page_content),
+        (["programs", "program","course", "mohawk", "college"], get_program_page_content),
         (["admission", "registration", "support", "services"], get_msa_or_services_content)
     ]:
         if any(w in refined_lower for w in checker):
@@ -271,6 +363,16 @@ async def websocket_endpoint(websocket: WebSocket):
             print(f"\n[WebSocket] Original Query: {msg}", flush=True)
             refined = await refine_query(msg)
             refined_lower = refined.lower()
+
+            # --- FUN FALLBACK FIRST ---
+            if any(term in refined_lower for term in [
+                "joke", "tell me a joke", "riddle", "story", "funny", "laugh", "game", "entertain"
+            ]):
+                print("[WebSocket] 🎭 Fun fallback triggered before RAG", flush=True)
+                fallback = await generate_fallback_response(refined, msg)
+                await db_manager.store_conversation(msg, fallback)
+                await websocket.send_json({"answer": fallback})
+                continue
 
             for checker, fetch_func in [
                 (["msa", "club", "student", "association"], get_msa_or_services_content),
@@ -298,6 +400,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     await db_manager.store_conversation(msg, result["result"])
     except WebSocketDisconnect:
         print("WebSocket disconnected", flush=True)
+
 
 # Health check
 @app.get("/health")

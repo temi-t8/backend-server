@@ -361,7 +361,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 fallback = await generate_fallback_response(refined, msg)
                 clean_fallback = fallback.replace("\n", " ").strip()
                 await db_manager.store_conversation(msg, clean_fallback)
-                await websocket.send_json({"answer": clean_fallback})
+                await websocket.send_text(clean_fallback)
                 continue
 
             for checker, fetch_func in [
@@ -376,7 +376,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         if not rag_result["fallback"]:
                             clean_answer = rag_result["answer"].replace("\n", " ").strip()
                             await db_manager.store_conversation(msg, clean_answer)
-                            await websocket.send_json({"answer": clean_answer})
+                            await websocket.send_text(clean_answer)
                             break
             else:
                 print("[WebSocket] Using local RAG...", flush=True)
@@ -385,11 +385,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     print("🔁 Triggering fallback: No good local RAG response", flush=True)
                     fallback = await generate_fallback_response(refined, msg)
                     clean_fallback = fallback.replace("\n", " ").strip()
-                    await db_manager.store_conversation(msg, clean_fallback)
-                    await websocket.send_json({"answer": clean_fallback})
+                    await db_manager.store_conversation(msg, fallback)
+                    await websocket.send_text(fallback)
                 else:
                     clean_answer = result["result"].replace("\n", " ").strip()
-                    await websocket.send_json({"answer": clean_answer})
+                    await websocket.send_text(clean_answer)
                     await db_manager.store_conversation(msg, clean_answer)
     except WebSocketDisconnect:
         print("WebSocket disconnected", flush=True)

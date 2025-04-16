@@ -1,3 +1,9 @@
+"""
+This module provides a FastAPI application that integrates with OpenAI for 
+query refinement and content generation, along with a MongoDB backend for 
+storing conversation data. It supports both REST and WebSocket endpoints.
+"""
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from typing import Optional
@@ -51,6 +57,7 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"]
 )
+
 rag_prompt = PromptTemplate(
     input_variables=["context", "question"],
     template="""
@@ -66,38 +73,84 @@ Question:
 """
 )
 
-
-# MongoDB Manager
 class DatabaseManager:
+    """
+    Manages all interactions with the MongoDB database, including connecting
+    and storing conversation data (query and answer) with timestamps.
+    """
     def __init__(self):
+        """
+        Initialize the DatabaseManager with None references to client, db, and collection.
+        """
         self.client = None
         self.db = None
         self.collection = None
 
     async def connect(self):
+        """
+        Connects to the MongoDB instance using the configured URI.
+        
+        Returns:
+            None
+        """
         self.client = AsyncIOMotorClient(MONGO_URI)
         self.db = self.client[DB_NAME]
         self.collection = self.db[COLLECTION_NAME]
         logger.info("Connected to MongoDB")
 
     async def store_conversation(self, query: str, answer: str):
+        """
+        Stores a conversation record (query and answer) in the MongoDB collection 
+        with an associated timestamp.
+        
+        Args:
+            query (str): The user query or message.
+            answer (str): The assistant's response or answer.
+        
+        Returns:
+            None
+        """
         await self.collection.insert_one({"query": query, "answer": answer, "timestamp": datetime.utcnow()})
 
 db_manager = DatabaseManager()
 
-# Models
 class QueryRequest(BaseModel):
+    """
+    Request model for receiving a query from the client.
+    """
     query: str
 
 class AnswerResponse(BaseModel):
+    """
+    Response model for returning an answer to the client.
+    """
     answer: str
 
-# --- Utilities ---
 def is_domain_related(query_lower: str) -> bool:
+    """
+    Checks if the given lowercased query contains any keywords 
+    that indicate it's related to Mohawk College.
+
+    Args:
+        query_lower (str): The query in lowercase form.
+
+    Returns:
+        bool: True if any Mohawk-related keywords are found, False otherwise.
+    """
     keywords = ["mohawk", "college", "campus", "student", "program", "course", "msa", "admission"]
     return any(word in query_lower for word in keywords)
 
 async def refine_query(original_query: str) -> str:
+    """
+    Uses an OpenAI model to correct minor spelling or recognition errors 
+    in the user's query, especially for Mohawk College programs.
+
+    Args:
+        original_query (str): The raw user query.
+
+    Returns:
+        str: A refined version of the query with corrections applied.
+    """
     system_prompt = (
         "You are a helpful assistant for Mohawk College. Your job is to fix minor spelling or recognition errors in the query. "
         "If it's a joke, story, fun question, or out-of-scope query, or weather related or time, leave it mostly untouched. "
@@ -120,6 +173,18 @@ async def refine_query(original_query: str) -> str:
         return original_query
 
 async def generate_fallback_response(refined_query: str, original_query: str) -> str:
+    """
+    Generates a fallback response using OpenAI if a query cannot be answered 
+    with Mohawk-related content or the local retrieval system. Includes logic 
+    for fun queries, time/weather queries, and inappropriate content handling.
+
+    Args:
+        refined_query (str): The refined user query.
+        original_query (str): The original user query.
+
+    Returns:
+        str: A suitable fallback response.
+    """
     rq_lower = refined_query.lower()
     fun_triggers = [
         "joke", "tell me a joke", "funny", "story", "short story",
@@ -213,9 +278,18 @@ async def generate_fallback_response(refined_query: str, original_query: str) ->
         print(f"[Fallback Crash] {e}", flush=True)
         return "Oops! Something went wrong while trying to respond. Try again shortly."
 
-
-
 async def get_program_page_content(query: str) -> Optional[str]:
+    """
+    Attempts to fetch and match program page content from Mohawk College's 
+    website by comparing query keywords against program titles.
+
+    Args:
+        query (str): The user query in lowercase.
+
+    Returns:
+        Optional[str]: A summarized response of matched programs, 
+                       or None if no matches are found or an error occurs.
+    """
     base_url = "https://www.mohawkcollege.ca"
     search_url = f"{base_url}/programs/search"
     try:
@@ -266,6 +340,17 @@ async def get_program_page_content(query: str) -> Optional[str]:
     return None
 
 async def get_msa_or_services_content(query: str) -> Optional[str]:
+    """
+    Fetches content from MSA (Mohawk Students' Association) or various 
+    services pages if the query appears relevant to these topics.
+
+    Args:
+        query (str): The refined user query in lowercase.
+
+    Returns:
+        Optional[str]: The retrieved text content (up to 5000 characters),
+                       or None if no relevant source is matched or an error occurs.
+    """
     sources = [
         ("msa", "https://mohawkstudents.ca/"),
         ("student association", "https://mohawkstudents.ca/"),
@@ -284,8 +369,14 @@ async def get_msa_or_services_content(query: str) -> Optional[str]:
                 print(f"[Crawler Error - MSA/Services] {e}", flush=True)
     return None
 
-# --- Local RAG ---
 def initialize_qa_chain():
+    """
+    Initializes the RetrievalQA chain by loading documents from the local 'data' folder,
+    splitting them into chunks, and creating a FAISS vector store for embeddings.
+
+    Returns:
+        RetrievalQA: The initialized retrieval QA chain object.
+    """
     print("[Init] Loading local documents...", flush=True)
     docs = []
     docs.extend(DirectoryLoader("data", glob="**/*.txt", loader_cls=TextLoader).load())
@@ -294,11 +385,25 @@ def initialize_qa_chain():
     vectordb = FAISS.from_documents(chunks, OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY))
     return RetrievalQA.from_chain_type(
         llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0.4, openai_api_key=OPENAI_API_KEY),
-        chain_type="stuff", retriever=vectordb.as_retriever()
+        chain_type="stuff",
+        retriever=vectordb.as_retriever()
     )
+
 qa_chain = initialize_qa_chain()
 
 def run_rag_on_text(query: str, content: str) -> dict:
+    """
+    Runs Retrieval-Augmented Generation (RAG) on a given block of text content.
+
+    Args:
+        query (str): The user's (refined) query.
+        content (str): The text content to be chunked, embedded, and searched.
+
+    Returns:
+        dict: A dictionary containing:
+              - "fallback" (bool): Indicates if no relevant docs were found.
+              - "answer" (Optional[str]): The answer if found, otherwise None.
+    """
     doc = Document(page_content=content)
     chunks = CharacterTextSplitter(chunk_size=1000, chunk_overlap=100).split_documents([doc])
     vectordb = FAISS.from_documents(chunks, OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY))
@@ -317,9 +422,20 @@ def run_rag_on_text(query: str, content: str) -> dict:
     result = rag_chain.invoke({"query": query})
     return {"fallback": False, "answer": result["result"]}
 
-# --- API Endpoints ---
 @app.post("/answer", response_model=AnswerResponse)
 async def answer_query(request: QueryRequest):
+    """
+    Handles incoming user queries via POST requests. 
+    It refines the query, checks if it needs external content (MSA, programs, services),
+    and if so, runs RAG on that content. Otherwise, it uses the local RAG 
+    to produce an answer. If all else fails, it generates a fallback response.
+
+    Args:
+        request (QueryRequest): The request body containing the user query.
+
+    Returns:
+        AnswerResponse: A Pydantic model containing the final answer.
+    """
     original = request.query.strip()
     refined = await refine_query(original)
     refined_lower = refined.lower()
@@ -345,6 +461,18 @@ async def answer_query(request: QueryRequest):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time, two-way communication. Refines
+    user queries, checks for fun queries, relevant external content, or 
+    local RAG answers, then sends a response. Also logs conversations 
+    in MongoDB.
+
+    Args:
+        websocket (WebSocket): The WebSocket connection instance.
+
+    Returns:
+        None
+    """
     await websocket.accept()
     try:
         while True:
@@ -394,20 +522,40 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         print("WebSocket disconnected", flush=True)
 
-# Health check
 @app.get("/health")
 async def health_check():
+    """
+    Health check endpoint to verify service status. 
+    Reports whether the service is running and the state of the DB connection.
+
+    Returns:
+        dict: A dictionary containing the service status, version, 
+              and database connection status.
+    """
     db_status = "healthy" if db_manager.client else "unavailable"
     return {"status": "running", "version": "1.0.0", "db_status": db_status}
 
-# Startup / Shutdown
 @app.on_event("startup")
 async def startup():
+    """
+    FastAPI event hook that runs on application startup. 
+    Connects to MongoDB via the DatabaseManager.
+
+    Returns:
+        None
+    """
     await db_manager.connect()
     logger.info("Service started")
 
 @app.on_event("shutdown")
 async def shutdown():
+    """
+    FastAPI event hook that runs on application shutdown. 
+    Closes the MongoDB connection if it exists.
+
+    Returns:
+        None
+    """
     if db_manager.client:
         db_manager.client.close()
     logger.info("Service stopped")
